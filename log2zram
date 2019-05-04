@@ -1,96 +1,191 @@
 #!/bin/bash
 
-. /etc/log2zram.conf
+SIZE=20M
+COMP_ALG=lz4
+LOG_DISK_SIZE=60M
+MKFS_OPTS="-O ^has_journal"
+MNT_OPTS="-o rw,noatime,async,nosuid,noexec,nodev,nobarrier,nodelalloc"
+ZDIR=/opt/zram
+HDD_LOG=/opt/zram/hdd.log
+DBG=true
 
+[ -f /etc/default/log2zram ] && . /etc/default/log2zram
 
 ZRAM_LOG=/var/log
 ZSHARE=/usr/local/share/log2zram
-ZLOG=${ZSHARE}/log/log2zram.log
+ZLIB=/usr/local/lib/log2zram
+ZLOG=${ZSHARE}/log2zram.log
+ZSTATE=/var/run/log2zram.device
 
-function version { echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'; }
-# set -x
+function version() { echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'; }
+function systemdShutdownInProgress() { systemctl list-jobs | egrep -q 'shutdown.target.*start'; }
+function systemdActive() { systemctl -q is-active $1; }
 
-createZramLogDrive () {
-	# Check Zram Class created
-	if modprobe --verbose --first-time zram  >>${ZLOG} 2>&1
-	then
-		DEV_NUM='0'
-	else
-		DEV_NUM=$(cat /sys/class/zram-control/hot_add)
-	fi
-	echo ${COMP_ALG} > /sys/block/zram${DEV_NUM}/comp_algorithm
-	echo ${LOG_DISK_SIZE} > /sys/block/zram${DEV_NUM}/disksize
-	echo ${SIZE} > /sys/block/zram${DEV_NUM}/mem_limit
-	mke2fs -v -t ext4 $MKFS_OPTS /dev/zram${DEV_NUM} >>${ZLOG} 2>&1 || return 1
+# TODO  better handle logging somehow, consider using logger to write to syslog
+# TODO  sort out open handles to zram device on hot_remove
+
+# decouple xtrace from stderr on Bash 4.0+
+# we'll send it to stderr's destination for now
+exec 3>&2
+if [[ $DBG ]]; then
+  if [ $(version $BASH_VERSION) -ge $(version "4.0") ]; then
+    export BASH_XTRACEFD="3"
+  fi
+  set -x
+fi
+
+function cleanup() {
+  # Your mother doesn't live here
+  rv=$?
+  _tmp=$1
+  if [[ "$_tmp" != /tmp/* ]]; then
+    echo "${FUNCNAME[0]}: Cowardly refusing to delete outside of /tmp/"
+    return $rv
+  fi
+  [ -d "$_tmp" ] && [ "$PWD" = "$_tmp" ] && cd /tmp
+  [ -e "$_tmp" ] && rm -rfv "$_tmp"
+  return $rv
 }
 
-mergeOverlay () {
-	echo "overlay lowerdir=${HDD_LOG},upperdir=${ZDIR}/zram${DEV_NUM}/upper" >>${ZLOG}
-	cd /usr/local/lib/log2zram/
-	./overlay merge -l "${HDD_LOG}" -u "${ZDIR}/zram${DEV_NUM}/upper" >>${ZLOG} 2>&1 || return 1
-	sh -x *.sh  >>${ZLOG} 2>&1 || return 1
-	rm -v *.sh  >>${ZLOG} 2>&1 || return 1
+function createZramLogDrive() {
+  # Check Zram Class created
+  if modprobe --verbose --first-time zram; then
+    DEV_NUM='0'
+  else
+    DEV_NUM=$(cat /sys/class/zram-control/hot_add)
+  fi
+  echo ${COMP_ALG} > /sys/block/zram${DEV_NUM}/comp_algorithm
+  echo ${LOG_DISK_SIZE} > /sys/block/zram${DEV_NUM}/disksize
+  echo ${SIZE} > /sys/block/zram${DEV_NUM}/mem_limit
+  mke2fs -v -t ext4 $MKFS_OPTS /dev/zram${DEV_NUM}
+}
+
+function mergeOverlay() {
+  echo "${FUNCNAME[0]}: overlay lowerdir=${HDD_LOG},upperdir=${ZDIR}/zram${DEV_NUM}/upper"
+  (
+    set -e
+    cd $(mktemp -t "log2zram.XXXXXXXX" -d)
+    trap "cleanup $PWD" EXIT
+    ${ZLIB}/overlay merge -l "${HDD_LOG}" -u "${ZDIR}/zram${DEV_NUM}/upper"
+    if [ $DBG ]; then sh -x *.sh; else sh *.sh; fi
+    # cleanup routine fires here
+  )
 }
 
 case "$1" in
-	start)
-		set -e
-		echo "log2zram start $(date +%Y-%m-%d-%H:%M:%S)" >>${ZLOG}
-		invoke-rc.d rsyslog stop >>${ZLOG} 2>&1
-		mkdir -p $HDD_LOG  >>${ZLOG} 2>&1
-		mount --verbose --bind $ZRAM_LOG/ $HDD_LOG/ >>${ZLOG} 2>&1
-		mount --verbose --make-private $HDD_LOG/ >>${ZLOG} 2>&1
-		createZramLogDrive >>${ZLOG} 2>&1
-		mkdir -vp ${ZDIR}/zram${DEV_NUM} >>${ZLOG} 2>&1
-		mount --verbose --types ext4 $MNT_OPTS /dev/zram${DEV_NUM} ${ZDIR}/zram${DEV_NUM}/ >>${ZLOG} 2>&1
-		mkdir -vp ${ZDIR}/zram${DEV_NUM}/upper ${ZDIR}/zram${DEV_NUM}/workdir ${ZRAM_LOG} >>${ZLOG} 2>&1
-		[ $(version `uname -r`) -le $(version "4.10") ] || IV_X_OPTS="redirect_dir=off,"
-		mount --verbose --types overlay -o ${IV_X_OPTS}lowerdir=${HDD_LOG},upperdir=${ZDIR}/zram${DEV_NUM}/upper,workdir=${ZDIR}/zram${DEV_NUM}/workdir overlay${DEV_NUM} ${ZRAM_LOG} >>${ZLOG} 2>&1
-		echo "/zram${DEV_NUM}" > ${ZSHARE}/zram-device-list
-		invoke-rc.d rsyslog restart >>${ZLOG} 2>&1
-		journalctl --flush >>${ZLOG} 2>&1
-		exit 0
-		;;
+  start)
+    (
+      set -e
+      echo "log2zram start $(date +%Y-%m-%d-%H:%M:%S)"
+      invoke-rc.d rsyslog stop
+      mkdir -vp $HDD_LOG
 
-	stop)
-		echo "log2zram stop $(date +%Y-%m-%d-%H:%M:%S)" >>${ZLOG}
-		ZRAM_DEV=$(cat ${ZSHARE}/zram-device-list)
-		DEV_NUM=$(echo "$ZRAM_DEV" | tr -dc '0-9')
-		invoke-rc.d rsyslog stop >>${ZLOG} 2>&1
-		if umount --verbose ${ZRAM_LOG}/ >>${ZLOG} 2>&1
-		then
-			echo "umount ${ZRAM_LOG}/" >>${ZLOG}
-		else
-		sleep .1
-			invoke-rc.d rsyslog stop  >>${ZLOG} 2>&1
-			umount --verbose -l ${ZRAM_LOG}/ >>${ZLOG} 2>&1
-		fi
-		mergeOverlay >>${ZLOG} 2>&1
-		if umount --verbose ${ZDIR}${ZRAM_DEV}/ >>${ZLOG} 2>&1
-		then
-			echo "umount ${ZDIR}${ZRAM_DEV}/" >>${ZLOG}
-		else
-			umount --verbose -l ${ZDIR}{ZRAM_DEV}/ >>${ZLOG} 2>&1
-		fi
-		if umount --verbose $HDD_LOG/ >>${ZLOG} 2>&1
-		then
-			echo "umount $HDD_LOG/" >>${ZLOG}
-		else
-			sleep .1
-			invoke-rc.d rsyslog stop  >>${ZLOG} 2>&1
-			umount --verbose -l $HDD_LOG/ >>${ZLOG} 2>&1
-		fi
-		if [ "$DEV_NUM" = "0" ]
-		then
-			rmmod zram
-		else
-			echo "$DEV_NUM" > /sys/class/zram-control/hot_remove
-		fi
-		invoke-rc.d rsyslog restart >>${ZLOG} 2>&1
-		exit 0
-		;;
+      # make /var/log available at /opt/zram/hdd.log, then make /opt/zram/hdd.log private
 
-	*)
-		echo "Usage: log2ram {start|stop}" >&2
-		exit 1
+      mount --verbose --bind $ZRAM_LOG/ $HDD_LOG/
+      mount --verbose --make-private $HDD_LOG/
+      createZramLogDrive
+      mkdir -vp ${ZDIR}/zram${DEV_NUM}
+      mount --verbose --types ext4 $MNT_OPTS /dev/zram${DEV_NUM} ${ZDIR}/zram${DEV_NUM}/
+      mkdir -vp ${ZDIR}/zram${DEV_NUM}/upper ${ZDIR}/zram${DEV_NUM}/workdir ${ZRAM_LOG}
+      [ $(version $(uname -r)) -ge $(version "4.10") ] && IV_X_OPTS="redirect_dir=off,"
+      OPTS="${IV_X_OPTS}lowerdir=${HDD_LOG},upperdir=${ZDIR}/zram${DEV_NUM}/upper"
+      OPTS="${OPTS},workdir=${ZDIR}/zram${DEV_NUM}/workdir"
+      mount --verbose --types overlay -o ${OPTS} overlay${DEV_NUM} ${ZRAM_LOG}
+      echo "zram${DEV_NUM}" > ${ZSTATE}
+      invoke-rc.d rsyslog restart
+      journalctl --flush
+      #) >> ${ZLOG} 2>&1
+    ) 2>&1 3>&1 | tee -a ${ZLOG}
+    ;;
+
+  stop)
+    {
+      # FIXME allow zram device removal; lots of open file handles happening
+
+      _services=("netdata" "unattended-upgrades")
+      _restart_services=()
+
+      echo "log2zram stop $(date +%Y-%m-%d-%H:%M:%S)"
+      ZDEV=$(< ${ZSTATE})
+      DEV_NUM=$(echo "$ZDEV" | tr -dc '0-9')
+      invoke-rc.d rsyslog stop
+
+      # stop services that hold locks
+
+      for _svc in "${_services[@]}"; do
+        if systemdActive $_svc; then
+          systemctl stop $_svc
+          _restart_services+=($_svc)
+        fi
+      done
+
+      lsof +D ${ZRAM_LOG} > "${ZSHARE}/stage1.lsof"
+      # nothing locked open here
+
+      if umount --verbose ${ZRAM_LOG}/; then
+        echo "umount ${ZRAM_LOG}/"
+      else
+        sleep .1
+        invoke-rc.d rsyslog stop
+        echo "lazy unmounting ${ZRAM_LOG}"
+        umount --verbose -l ${ZRAM_LOG}/
+      fi
+
+      # merging /opt/zram/zram{?}/upper contents (upper) into original log location
+      #   /opt/zram/hdd.log (lower)
+
+      mergeOverlay
+
+      lsof +D ${ZDIR}/${ZDEV}/ > "${ZSHARE}/stage2.lsof"
+      # netdata has open files at this point
+
+      # unmount /opt/zram/zram{?}/
+      if umount --verbose ${ZDIR}/${ZDEV}/; then
+        echo "umount ${ZDIR}/${ZDEV}/"
+      else
+        echo "lazy unmounting ${ZDIR}/${ZDEV}"
+        umount --verbose -l ${ZDIR}/${ZDEV}/
+      fi
+
+      lsof +D ${HDD_LOG}/ > "${ZSHARE}/stage3.lsof"
+      # unattended-upgrades and journald have open files here
+
+      # unbinding /var/log from /opt/zram/hdd.log
+      if umount --verbose $HDD_LOG/; then
+        echo "umount $HDD_LOG/"
+      else
+        sleep .1
+        invoke-rc.d rsyslog stop
+        echo "lazy unmounting ${HDD_LOG}"
+        umount --verbose -l $HDD_LOG/
+      fi
+      echo "$DEV_NUM" > /sys/class/zram-control/hot_remove
+
+      #TODO test when to do this, I think after unbinding from /opt/zram
+      #     but before attempting to remove zram module is the spot
+
+      journalctl --flush
+
+      # remove module only if no longer in use
+      (zramctl | grep -q '/dev/zram') &>/dev/null || rmmod zram
+
+      invoke-rc.d rsyslog restart
+      if ! systemdShutdownInProgress; then
+        for _svc in "${_restart_services[@]}"; do
+          systemctl restart $_svc
+        done
+      fi
+
+      # cleanup
+      rm -fv ${ZSTATE}
+      #}
+      #} >> ${ZLOG} 2>&1
+    } 2>&1 3>&1 | tee -a ${ZLOG}
+    ;;
+
+  *)
+    echo "Usage: log2ram {start|stop}" >&2
+    exit 1
+    ;;
 esac
